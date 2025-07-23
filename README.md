@@ -12,9 +12,9 @@ raise a GitHub issue or open a pull request with a fix.
 
 As in previous assignments, we use `uv` to manage dependencies.
 
-1. Install all packages except `flash-attn`, then all packages (`flash-attn` is weird)
+1. Install all packages except `flash-attn` and `xformers`, then all packages (`flash-attn` is weird, and `xformers` needs to be installed after `torch`)
 ```
-uv sync --no-install-package flash-attn
+uv sync --no-install-package flash-attn --no-install-package xformers
 uv sync
 ```
 
@@ -28,3 +28,6 @@ Initially, all tests should fail with `NotImplementedError`s.
 To connect your implementation to the tests, complete the
 functions in [./tests/adapters.py](./tests/adapters.py).
 
+## 注意事项
+25.7.23：
+由于实验室服务器CUDA驱动太低，用不了flash-attn和vllm（但 vllm 的预编译包要求必须是 11.8）
