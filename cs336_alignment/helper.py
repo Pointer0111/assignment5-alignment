@@ -19,5 +19,12 @@ def tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer):
             response_mask (torch.Tensor): 形状为 (batch_size, max(prompt_and_output_lens) - 1)，
                 在labels中回复token处为1，其余为0的掩码。
     """
-    raise NotImplementedError("Not implemented")
+    
+    ans = {}
+    
+    ans["input_ids"] = torch.tensor([tokenizer.encode(prompt_strs[i] + output_strs[i]) for i in range(len(prompt_strs))])
+    ans["labels"] = ans["input_ids"][:, 1:]
+    ans["response_mask"] = (ans["labels"] != tokenizer.pad_token_id).float()
+
+    return ans
 

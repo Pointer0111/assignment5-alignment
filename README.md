@@ -30,4 +30,6 @@ functions in [./tests/adapters.py](./tests/adapters.py).
 
 ## 注意事项
 25.7.23：
-由于实验室服务器CUDA驱动太低，用不了flash-attn和vllm（但 vllm 的预编译包要求必须是 11.8）
+- 由于实验室服务器CUDA驱动太低，用不了flash-attn和vllm（但 vllm 的预编译包要求必须是 11.8）
+
+- 由于部署LLaMA-3.1-70B-Instruct模型需要至少两块H100，因此没法做A5的附加作业。
