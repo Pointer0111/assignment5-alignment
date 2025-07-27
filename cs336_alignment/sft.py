@@ -1,16 +1,17 @@
-from __future__ import annotations
-
+from importlib import metadata
 import os
+from re import T
 from typing import Any, Callable, Literal
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from cs336_alignment.sft import *
-from cs336_alignment.grpo import *
 
-def run_tokenize_prompt_and_output(
+from cs336_alignment.grpo import masked_normalize
+
+
+def tokenize_prompt_and_output(
     prompt_strs: list[str],
     output_strs: list[str],
     tokenizer: PreTrainedTokenizerBase,
@@ -32,10 +33,38 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    return tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
+    ans = {}
+    prompt_tokenized = tokenizer(prompt_strs)['input_ids']
+    output_tokenized = tokenizer(output_strs)['input_ids']
+     
+    tokenized = [ p + o for (p, o) in zip(prompt_tokenized, output_tokenized)]
+    max_len = max([len(t) for t in tokenized]) - 1
+    bs = len(tokenized)
+
+    input_ids = torch.zeros((bs, max_len), dtype=torch.long)
+    labels = torch.zeros((bs, max_len), dtype=torch.long) 
+    response_mask = torch.zeros((bs, max_len), dtype=torch.bool)
+
+    for i, tokens in enumerate(tokenized):
+        input_ids[i, :len(tokens)-1] = torch.tensor(tokens[:-1])
+        labels[i, :len(tokens)-1] = torch.tensor(tokens[1:])
+        if len(tokens) < max_len:
+            labels[i, len(tokens)-1:] = tokenizer.eos_token_id
+        response_mask[i, len(prompt_tokenized[i])-1:len(tokens)-1] = True
+
+    # 将input_ids最后一列等于0的地方替换为tokenizer.eos_token_id
+    last_col_idx = max_len - 1
+    mask = input_ids[:, last_col_idx] == 0
+    input_ids[mask, last_col_idx] = tokenizer.eos_token_id
+
+    ans["input_ids"] = input_ids
+    ans["labels"] = labels
+    ans["response_mask"] = response_mask
+
+    return ans
 
 
-def run_compute_group_normalized_rewards(
+def compute_group_normalized_rewards(
     reward_fn: Callable,
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
@@ -78,15 +107,17 @@ def run_compute_group_normalized_rewards(
                 You may choose what you wish to log here
                 (some statistics of the rewards, etc.).
     """
-    return compute_group_normalized_rewards(reward_fn, rollout_responses, repeated_ground_truths, group_size, advantage_eps, normalize_by_std)
+
+    pass 
 
 
-def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    return compute_entropy(logits)
+
+    return torch.logsumexp(logits, dim=-1) - (logits * logits.softmax(dim=-1)).sum(dim=-1)
 
 
-def run_get_response_log_probs(
+def get_response_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
@@ -115,10 +146,16 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    return get_response_log_probs(model, input_ids, labels, return_token_entropy)
+    ans = {}
+    logits = model(input_ids).logits
+    ans["log_probs"] = torch.log(torch.gather(logits.softmax(dim=-1), dim=-1, index=labels.unsqueeze(-1)).squeeze(-1))
+    if return_token_entropy:
+        ans["token_entropy"] = compute_entropy(logits)
+
+    return ans
 
 
-def run_compute_naive_policy_gradient_loss(
+def compute_naive_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
 ) -> torch.Tensor:
@@ -134,10 +171,10 @@ def run_compute_naive_policy_gradient_loss(
         torch.Tensor of shape (batch_size, sequence_length): 
             the policy gradient per-token loss.
     """
-    return compute_naive_policy_gradient_loss(raw_rewards_or_advantages, policy_log_probs)
+    raise NotImplementedError
 
 
-def run_compute_grpo_clip_loss(
+def compute_grpo_clip_loss(
     advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
@@ -161,10 +198,10 @@ def run_compute_grpo_clip_loss(
             dict[str, torch.Tensor]: metadata for the GRPO-Clip loss 
                 (used to compute clip fraction).
     """
-    return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    raise NotImplementedError
 
 
-def run_compute_policy_gradient_loss(
+def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
     loss_type: str,
     raw_rewards: torch.Tensor,
@@ -175,10 +212,10 @@ def run_compute_policy_gradient_loss(
     """
     Wrapper that delegates to the appropriate policy gradient loss function above.
     """
-    return compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
+    raise NotImplementedError
 
 
-def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:
+def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:
     """Compute the mean of the tensor along a dimension,
     considering only the elements with mask value 1.
 
@@ -194,20 +231,39 @@ def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = 
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    return masked_mean(tensor, mask, dim)
+    
+    # 计算mask中非零元素的数量，避免除零错误
+    mask_count = torch.count_nonzero(mask, dim=dim)
+    
+    # 计算masked sum并除以非零元素数量
+    return torch.sum(tensor.masked_fill(~mask, 0), dim=dim) / mask_count
 
-def run_sft_microbatch_train_step(
+def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
-    normalize_constant: int | None = 1.0,
+    normalize_constant,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
     """
-    return sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps, normalize_constant)
+
+    # 对每个样本分别计算 masked sum，然后除以 normalize_constant，最后求平均
+    # 在梯度累积中，需要将损失除以累积步数
+    loss = - masked_normalize(policy_log_probs, response_mask, dim=-1, normalize_constant=normalize_constant).mean() / gradient_accumulation_steps
+    loss.backward()
+
+    metadata = {
+        "loss": loss.detach().cpu(),
+        "policy_log_probs_mean": policy_log_probs.mean().detach().cpu(),
+        "policy_log_probs_std": policy_log_probs.std().detach().cpu(),
+        "num_masked_tokens": response_mask.sum().item(),
+        "normalize_constant": normalize_constant,
+    }
+
+    return (loss, metadata)
 
     
-def run_grpo_microbatch_train_step(
+def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
@@ -243,41 +299,10 @@ def run_grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
-    return grpo_microbatch_train_step(
-        policy_log_probs,
-        response_mask,
-        gradient_accumulation_steps,
-        loss_type,
-        raw_rewards,
-        advantages,
-        old_log_probs,
-        cliprange,
-    )
+    raise NotImplementedError
 
 
-def run_masked_normalize(
-    tensor: torch.Tensor,
-    mask: torch.Tensor,
-    dim: int | None = None,
-    normalize_constant: float = 1.0,
-) -> torch.Tensor:
-    """Sum over a dimension and normalize by a constant,
-    considering only the elements with mask value 1.
 
-    Args:
-        tensor: torch.Tensor, the tensor to sum and normalize.
-        mask: torch.Tensor, the mask. We only consider elements
-            with mask value 1.
-        dim: int | None, the dimension to sum along before
-            normalization. If None, sum over all dimensions.
-        normalize_constant: float, the constant to divide by
-            for normalization.
-
-    Returns:
-        torch.Tensor, the normalized sum, where masked elements
-            (mask=0) don't contribute to the sum.
-    """
-    return masked_normalize(tensor, mask, dim, normalize_constant)
 
 
 """
@@ -316,7 +341,7 @@ def get_packed_sft_dataset(
     raise NotImplementedError
 
 
-def run_iterate_batches(
+def iterate_batches(
     dataset: Dataset,
     batch_size: int,
     shuffle: bool,
@@ -336,10 +361,10 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    return iterate_batches(dataset, batch_size, shuffle)
+    raise NotImplementedError
 
 
-def run_parse_mmlu_response(
+def parse_mmlu_response(
     mmlu_example: dict[str, Any],
     model_output: str,
 ) -> str | None:
@@ -362,10 +387,10 @@ def run_parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    return parse_mmlu_response(mmlu_example, model_output)
+    raise NotImplementedError
 
 
-def run_parse_gsm8k_response(
+def parse_gsm8k_response(
     model_output: str,
 ) -> str | None:
     """
@@ -379,10 +404,10 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    return parse_gsm8k_response(model_output)
+    raise NotImplementedError
 
 
-def run_compute_per_instance_dpo_loss(
+def compute_per_instance_dpo_loss(
     lm: torch.nn.Module,
     lm_ref: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
@@ -414,6 +439,4 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    return compute_per_instance_dpo_loss(
-        lm, lm_ref, tokenizer, beta, prompt, response_chosen, response_rejected
-    )
+    raise NotImplementedError
