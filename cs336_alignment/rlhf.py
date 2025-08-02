@@ -3,43 +3,19 @@ The below adapters are used in the optional
 RLHF / safety part of the Alignment assignment.
 """
 
-import os
+import re
 from typing import Any
+import torch.nn.functional as F
 
-import torch
-from torch.utils.data import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from .sft import *
 
+import json
+import random
+import torch
+from torch.utils.data import Dataset
 
-def packed_sft_dataset(
-    tokenizer: PreTrainedTokenizerBase,
-    dataset_path: str | os.PathLike,
-    seq_length: int,
-    shuffle: bool,
-) -> Dataset:
-    """
-    Given a tokenizer and a path to a dataset with instruction-tuning examples,
-    construct a PyTorch Dataset for language modeling. The examples should be
-    packed, i.e., all sequences in the dataset are of a constant length (`seq_length`).
-
-    Args:
-        tokenizer: transformers.PreTrainedTokenizerBase
-            Transformers tokenizer to use in tokenizing and encoding text.
-        dataset_path: str
-            Path to file with instruction-tuning examples.
-        seq_length: int
-            Number of tokens to include in each example.
-        shuffle: bool
-            If true, shuffle the documents before packing them into examples.
-
-    Returns:
-        PyTorch Dataset for language modeling. Each example in this dataset is a dictionary of
-        with keys "input_ids" and "labels" (both tensors of shape (seq_length, )).
-        "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
-        the token IDs for the language modeling labels.
-    """
-    raise NotImplementedError
 
 
 def iterate_batches(
@@ -62,7 +38,7 @@ def iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 def parse_mmlu_response(
@@ -88,7 +64,15 @@ def parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    # 使用正则表达式匹配 "The correct answer is X" 格式
+    # 其中 X 应该是 A、B、C 或 D 中的一个字母
+    pattern = r"The correct answer is\s+([ABCD])"
+    match = re.search(pattern, model_output, re.IGNORECASE)
+    
+    if match:
+        return match.group(1).upper()
+    
+    return None
 
 
 def parse_gsm8k_response(
@@ -105,8 +89,21 @@ def parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    # 使用正则表达式匹配所有数字（包括整数和小数）
+    # \d+ 匹配一个或多个数字
+    # (?:\.\d+)? 匹配可选的小数部分
+    pattern = r'\d+(?:\.\d+)?'
+    matches = re.findall(pattern, model_output)
+    
+    # 如果找到数字，返回最后一个
+    if matches:
+        return matches[-1]
+    
+    return None
 
+
+
+template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n{response}"
 
 def compute_per_instance_dpo_loss(
     lm: torch.nn.Module,
@@ -140,4 +137,66 @@ def compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    
+    # 设置模型为评估模式
+    lm.eval()
+    lm_ref.eval()
+    
+    # 使用Alpaca模板格式化prompt和response，并添加EOS token
+    eos_token = tokenizer.eos_token if tokenizer.eos_token is not None else "<|endoftext|>"
+    if isinstance(eos_token, list):
+        eos_token = eos_token[0]
+    text_chosen = template.format(instruction=prompt, response=response_chosen) + eos_token
+    text_rejected = template.format(instruction=prompt, response=response_rejected) + eos_token
+    
+    # 对完整文本进行tokenization
+    tokens_chosen = tokenizer(text_chosen, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    tokens_rejected = tokenizer(text_rejected, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    
+    # 确保tokens是1维张量 (去掉batch维度)
+    if tokens_chosen.dim() > 1:
+        tokens_chosen = tokens_chosen.squeeze(0)
+    if tokens_rejected.dim() > 1:
+        tokens_rejected = tokens_rejected.squeeze(0)
+    
+    # 计算logits (需要重新添加batch维度)
+    with torch.no_grad():
+        logits_lm_chosen = lm(tokens_chosen.unsqueeze(0)).logits.squeeze(0)  # [seq_len, vocab_size]
+        logits_ref_chosen = lm_ref(tokens_chosen.unsqueeze(0)).logits.squeeze(0)
+        
+        logits_lm_rejected = lm(tokens_rejected.unsqueeze(0)).logits.squeeze(0)
+        logits_ref_rejected = lm_ref(tokens_rejected.unsqueeze(0)).logits.squeeze(0)
+    
+    # 计算对数概率
+    log_probs_lm_chosen = torch.log_softmax(logits_lm_chosen, dim=-1)
+    log_probs_ref_chosen = torch.log_softmax(logits_ref_chosen, dim=-1)
+    log_probs_lm_rejected = torch.log_softmax(logits_lm_rejected, dim=-1)
+    log_probs_ref_rejected = torch.log_softmax(logits_ref_rejected, dim=-1)
+    
+    # 计算序列对数概率：对于每个位置预测下一个token
+    # tokens[1:]是target，因为我们要预测每个位置的下一个token
+    # log_probs[:-1]是logits，因为最后一个位置没有下一个token可预测
+    chosen_target_ids = tokens_chosen[1:]  # [seq_len-1]
+    rejected_target_ids = tokens_rejected[1:]  # [seq_len-1]
+    
+    # 获取每个位置的对数概率
+    log_probs_lm_chosen = log_probs_lm_chosen[:-1].gather(-1, chosen_target_ids.unsqueeze(-1)).squeeze(-1)
+    log_probs_ref_chosen = log_probs_ref_chosen[:-1].gather(-1, chosen_target_ids.unsqueeze(-1)).squeeze(-1)
+    log_probs_lm_rejected = log_probs_lm_rejected[:-1].gather(-1, rejected_target_ids.unsqueeze(-1)).squeeze(-1)
+    log_probs_ref_rejected = log_probs_ref_rejected[:-1].gather(-1, rejected_target_ids.unsqueeze(-1)).squeeze(-1)
+    
+    # 计算整个序列的对数概率（求和）
+    log_prob_lm_chosen = log_probs_lm_chosen.sum()
+    log_prob_ref_chosen = log_probs_ref_chosen.sum()
+    log_prob_lm_rejected = log_probs_lm_rejected.sum()
+    log_prob_ref_rejected = log_probs_ref_rejected.sum()
+    
+    # 计算对数概率比率
+    log_ratio_chosen = log_prob_lm_chosen - log_prob_ref_chosen
+    log_ratio_rejected = log_prob_lm_rejected - log_prob_ref_rejected
+    
+    # 计算DPO损失：-log(σ(β * (log_ratio_chosen - log_ratio_rejected)))
+    loss = -F.logsigmoid(beta * (log_ratio_chosen - log_ratio_rejected))
+    
+    return loss 
+
