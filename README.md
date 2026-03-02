@@ -28,8 +28,11 @@ Initially, all tests should fail with `NotImplementedError`s.
 To connect your implementation to the tests, complete the
 functions in [./tests/adapters.py](./tests/adapters.py).
 
-## 注意事项
+## 修改日志
 25.7.23：
-- 由于实验室服务器CUDA驱动太低，用不了flash-attn和vllm（但 vllm 的预编译包要求必须是 11.8）
+- ~~ 由于实验室服务器CUDA驱动太低，用不了flash-attn和vllm（但 vllm 的预编译包要求必须是 11.8）~~
 
-- 由于部署LLaMA-3.1-70B-Instruct模型需要至少两块H100，因此没法做A5的附加作业。
+- ~~由于部署LLaMA-3.1-70B-Instruct模型需要至少两块H100，因此没法做A5的附加作业。~~
+
+26.3.2：
+- 开始用这个项目学习SFT/RLHF
